@@ -1108,9 +1108,21 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    if args.forward_backward_cpu_affinity is not None and args.fine_grained_activation_offloading:
+        raise RuntimeError(
+            "--forward-backward-cpu-affinity cannot be used with "
+            "--fine-grained-activation-offloading because fine-grained activation "
+            "offloading applies a process-wide CPU affinity mask."
+        )
+
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
+
+    if args.forward_backward_cpu_affinity is not None:
+        from megatron.training.thread_affinity import initialize_forward_backward_cpu_affinity
+
+        initialize_forward_backward_cpu_affinity(args.forward_backward_cpu_affinity)
 
 
     if cfg_container.logger.log_progress:
@@ -2224,18 +2236,26 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
-        )
+        if args.forward_backward_cpu_affinity is not None:
+            from megatron.training.thread_affinity import forward_backward_cpu_affinity
+
+            affinity_context = forward_backward_cpu_affinity()
+        else:
+            affinity_context = nullcontext()
+
+        with affinity_context:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+            )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()

@@ -2542,6 +2542,11 @@ def _add_training_args(parser):
                        help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
+    group.add_argument('--forward-backward-cpu-affinity', type=str, default=None,
+                       help='CPU list for forward/backward dispatch threads, e.g. '
+                       '"0,1,8-11". Pins only the main thread during '
+                       'forward_backward_func and PyTorch pt_autograd_* threads; '
+                       'other threads keep launch-time affinity.')
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
