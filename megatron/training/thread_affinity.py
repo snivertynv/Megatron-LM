@@ -101,12 +101,15 @@ def initialize_forward_backward_cpu_affinity(cpu_list: str) -> None:
         raise RuntimeError("--forward-backward-cpu-affinity requires /proc thread metadata")
 
     requested_cpus = _parse_cpu_list(cpu_list)
-    original_cpus = os.sched_getaffinity(0)
-    if not requested_cpus.issubset(original_cpus):
+    cpu_count = os.cpu_count()
+    if cpu_count is None:
+        raise RuntimeError("--forward-backward-cpu-affinity could not determine CPU count")
+    online_cpus = set(range(cpu_count))
+    if not requested_cpus.issubset(online_cpus):
         raise ValueError(
-            "--forward-backward-cpu-affinity must be a subset of the launch affinity. "
+            "--forward-backward-cpu-affinity must be a subset of online CPUs. "
             f"requested={_format_cpu_list(requested_cpus)} "
-            f"launch_affinity={_format_cpu_list(original_cpus)}"
+            f"online_cpus={_format_cpu_list(online_cpus)}"
         )
 
     _force_autograd_thread_creation()
