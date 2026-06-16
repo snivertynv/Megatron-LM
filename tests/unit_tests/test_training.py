@@ -9,7 +9,10 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training.training import (
+    _get_vpp_data_loader_num_workers,
+    build_train_valid_test_data_iterators,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -90,6 +93,22 @@ class TestTraining:
         assert next(valid_iters[1]) == 20
         # data_parallel_size=1, so MAX across DP ranks equals the local lengths
         assert args.eval_iters == [2, 3]
+
+    def test_vpp_data_loader_num_workers_splits_total_worker_count(self):
+        args = SimpleNamespace(num_workers=8)
+        workers = [_get_vpp_data_loader_num_workers(args, 4, vp_stage) for vp_stage in range(4)]
+        assert workers == [2, 2, 2, 2]
+        assert sum(workers) == args.num_workers
+
+        args.num_workers = 10
+        workers = [_get_vpp_data_loader_num_workers(args, 4, vp_stage) for vp_stage in range(4)]
+        assert workers == [3, 3, 2, 2]
+        assert sum(workers) == args.num_workers
+
+        args.num_workers = 2
+        workers = [_get_vpp_data_loader_num_workers(args, 4, vp_stage) for vp_stage in range(4)]
+        assert workers == [1, 1, 0, 0]
+        assert sum(workers) == args.num_workers
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):

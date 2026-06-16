@@ -1338,7 +1338,8 @@ def pretrain(
             if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                 vp_stage_train_valid_test_dataset_provider.is_distributed = True
             iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
+                vp_stage_train_valid_test_dataset_provider,
+                num_workers=_get_vpp_data_loader_num_workers(args, len(model), vp_stage),
             )
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
@@ -4165,7 +4166,19 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def _get_vpp_data_loader_num_workers(args, num_model_chunks, vp_stage):
+    """Split the per-rank dataloader worker budget across VPP model chunks."""
+    if args.num_workers == 0:
+        return 0
+
+    assert num_model_chunks > 0
+    workers_per_chunk, remaining_workers = divmod(args.num_workers, num_model_chunks)
+    return workers_per_chunk + int(vp_stage < remaining_workers)
+
+
+def build_train_valid_test_data_loaders(
+    build_train_valid_test_datasets_provider, num_workers=None
+):
     """Build pretraining data loaders."""
 
     args = get_args()
@@ -4221,20 +4234,30 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if args.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+                train_dataloader = build_pretraining_data_loader(
+                    train_ds, consumed_train_samples_in_current_phase, num_workers=num_workers
+                )
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if args.skip_train or args.full_validation:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                    valid_dataloaders.append(
+                        build_pretraining_data_loader(valid_d, 0, num_workers=num_workers)
+                    )
                 else:
                     if args.multiple_validation_sets:
                         # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
                         # correct and needs to be calculated/set per validation set
                         raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+                    valid_dataloaders.append(
+                        build_pretraining_data_loader(
+                            valid_d, args.consumed_valid_samples, num_workers=num_workers
+                        )
+                    )
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
-            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            test_dataloader = build_pretraining_data_loader(
+                test_ds, 0, num_workers=num_workers
+            )
             do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
             do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
@@ -4253,14 +4276,16 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(
+    build_train_valid_test_datasets_provider, num_workers=None
+):
     """Build pretraining data iterators."""
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider, num_workers=num_workers
     )
 
     # Build iterators.

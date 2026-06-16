@@ -16,12 +16,13 @@ from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 
-def build_pretraining_data_loader(dataset, consumed_samples):
+def build_pretraining_data_loader(dataset, consumed_samples, num_workers=None):
     """Build dataloader given an input dataset."""
 
     if dataset is None:
         return None
     args = get_args()
+    effective_num_workers = args.num_workers if num_workers is None else num_workers
 
     if hasattr(dataset, 'split'):
         split = dataset.split
@@ -94,9 +95,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         if args.exit_signal_handler:
             DistributedSignalHandler(args.exit_signal).__enter__()
 
-    maybe_worker_init_fn = (
-        worker_init_fn if args.num_workers > 0 else None
-    )
+    maybe_worker_init_fn = worker_init_fn if effective_num_workers > 0 else None
     # Torch dataloader.
     if args.hybrid_context_parallel:
         extra_kwargs = {"collate_fn": lambda x: x,}
@@ -105,9 +104,9 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
-        num_workers=args.num_workers,
+        num_workers=effective_num_workers,
         pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False,
+        persistent_workers=True if effective_num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
         **extra_kwargs,
     )
