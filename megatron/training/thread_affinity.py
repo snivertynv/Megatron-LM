@@ -14,6 +14,14 @@ from megatron.training.utils import print_rank_0
 _AUTOGRAD_THREAD_RE = re.compile(r"^pt_autograd_\d+$")
 _FORWARD_BACKWARD_CPU_AFFINITY: Optional[Set[int]] = None
 
+# Number of forward/backward calls to run with temporary per-step pinning before
+# switching to permanent pinning.  By this point all lazy NCCL proxy threads
+# (spawned on first pipeline send/recv or first all-reduce) will be running and
+# can be explicitly swept back to HELPER CPUs.
+_FINALIZE_AFTER_STEPS = 2
+_STEP_COUNT = 0
+_PERMANENTLY_PINNED = False
+
 
 def _parse_cpu_list(cpu_list: str) -> Set[int]:
     """Parse Linux cpulist syntax, e.g. ``"0,1,8-11"``."""
@@ -75,6 +83,25 @@ def _pin_autograd_threads(cpus: Set[int]) -> int:
     return pinned
 
 
+def _reset_non_pct_threads(pct_cpus: Set[int], helper_cpus: Set[int]) -> int:
+    """Reset every live thread that is not the main thread and not a
+    pt_autograd_* thread back to helper_cpus.  Called once at finalization
+    to push any lazily-spawned NCCL proxy threads off PCT cores."""
+    main_tid = os.getpid()
+    reset = 0
+    for tid, name in _iter_thread_ids_and_names():
+        if tid == main_tid:
+            continue
+        if _AUTOGRAD_THREAD_RE.match(name):
+            continue
+        try:
+            os.sched_setaffinity(tid, helper_cpus)
+            reset += 1
+        except OSError:
+            pass
+    return reset
+
+
 def _force_autograd_thread_creation() -> None:
     """Create the CUDA autograd worker thread before the main thread is narrowed."""
     if not torch.cuda.is_available():
@@ -88,8 +115,10 @@ def _force_autograd_thread_creation() -> None:
 def initialize_forward_backward_cpu_affinity(cpu_list: str) -> None:
     """Initialize opt-in CPU pinning for forward/backward dispatch threads.
 
-    NCCL and other helper threads are intentionally left untouched so they keep
-    the affinity mask inherited from process launch.
+    pt_autograd_* threads are pinned immediately.  The main thread is pinned
+    permanently after _FINALIZE_AFTER_STEPS forward/backward calls, at which
+    point all lazy NCCL proxy threads are already running and get explicitly
+    reset to HELPER CPUs before the main thread is narrowed.
     """
     global _FORWARD_BACKWARD_CPU_AFFINITY
 
@@ -120,17 +149,44 @@ def initialize_forward_backward_cpu_affinity(cpu_list: str) -> None:
         "Forward/backward CPU affinity enabled: "
         f"cpus={_format_cpu_list(requested_cpus)}, "
         f"pinned_autograd_threads={pinned_autograd_threads}. "
-        "Other threads keep their launch-time affinity."
+        f"Main thread will be permanently pinned after {_FINALIZE_AFTER_STEPS} steps "
+        "(deferred to allow lazy NCCL proxy threads to spawn on HELPER CPUs first)."
     )
 
 
 @contextmanager
 def _forward_backward_cpu_affinity_context():
+    global _STEP_COUNT, _PERMANENTLY_PINNED
+
     requested_cpus = _FORWARD_BACKWARD_CPU_AFFINITY
     if requested_cpus is None:
         yield
         return
 
+    if _PERMANENTLY_PINNED:
+        yield
+        return
+
+    _STEP_COUNT += 1
+
+    if _STEP_COUNT >= _FINALIZE_AFTER_STEPS:
+        # All lazy NCCL proxy threads should be spawned by now.
+        # Snapshot helper CPUs while the main thread still has HELPER affinity.
+        helper_cpus = os.sched_getaffinity(0)
+        reset = _reset_non_pct_threads(requested_cpus, helper_cpus)
+        os.sched_setaffinity(0, requested_cpus)
+        _PERMANENTLY_PINNED = True
+        print_rank_0(
+            f"Forward/backward CPU affinity finalized: main thread permanently pinned to "
+            f"cpus={_format_cpu_list(requested_cpus)}, "
+            f"reset {reset} other threads to helper cpus={_format_cpu_list(helper_cpus)}."
+        )
+        yield
+        return  # no restore — permanently pinned
+
+    # Steps 1 .. _FINALIZE_AFTER_STEPS-1: temporary per-step pinning so the
+    # main thread stays on HELPER CPUs when not in forward/backward, ensuring
+    # any NCCL threads spawned during these steps inherit HELPER affinity.
     previous_cpus = os.sched_getaffinity(0)
     os.sched_setaffinity(0, requested_cpus)
     try:
