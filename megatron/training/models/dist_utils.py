@@ -15,6 +15,10 @@ from megatron.core.distributed import (
     FullyShardedDataParallel,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    tag_params_for_buffer_routing,
+)
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel
@@ -203,6 +207,7 @@ def _ddp_wrap(
     overlap_param_gather_with_optimizer_step: bool,
     use_megatron_fsdp: bool = False,
     use_torch_fsdp2: bool = False,
+    use_layer_wise_param_layout: bool = False,
     *,
     pg_collection: ProcessGroupCollection,
 ) -> list[MegatronModule]:
@@ -216,6 +221,8 @@ def _ddp_wrap(
             for overlapping parameter gathering with optimizer step
         use_megatron_fsdp: Whether to use Megatron FSDP.
         use_torch_fsdp2: Whether to use PyTorch FSDP v2 instead of DDP
+        use_layer_wise_param_layout: Whether DDP should use the whole-parameter,
+            shard-aligned layout required by layer-wise distributed optimizers.
         pg_collection: Model communication process groups.
 
     Returns:
@@ -232,6 +239,15 @@ def _ddp_wrap(
         DP = TorchFullyShardedDataParallel
     else:
         DP = DistributedDataParallel
+
+    compute_full_param_layout = DistributedOptimizer.compute_full_param_layout
+    if use_layer_wise_param_layout:
+        if DP is not DistributedDataParallel or not ddp_config.use_distributed_optimizer:
+            raise ValueError(
+                "use_layer_wise_param_layout requires DDP with use_distributed_optimizer=True"
+            )
+        tag_params_for_buffer_routing(model)
+        compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
 
     if not use_torch_fsdp2:
         if ddp_config.num_buckets is not None:
@@ -272,9 +288,12 @@ def _ddp_wrap(
                 all_params = [p for p in model_chunk.parameters() if p.requires_grad]
                 pp_rank = pg_collection.pp.rank()
                 effective_bucket_size = (
-                    None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
+                    None
+                    if disable_bucketing
+                    or (pp_rank > 0 and not ddp_config.bucket_on_all_pipeline_stages)
+                    else ddp_config.bucket_size
                 )
-                chunk_kwargs["full_param_layout"] = DistributedOptimizer.compute_full_param_layout(
+                chunk_kwargs["full_param_layout"] = compute_full_param_layout(
                     all_params,
                     effective_bucket_size,
                     pg_collection.dp_cp.size(),

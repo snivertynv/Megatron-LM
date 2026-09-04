@@ -53,7 +53,16 @@ class DistributedDataParallelConfig:
     num_buckets: Optional[int] = None
     """Number of buckets for data-parallel communication. Should only specify one of
        `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
-       will be determined at runtime."""
+    will be determined at runtime."""
+
+    bucket_on_all_pipeline_stages: bool = False
+    """If true, preserve gradient/parameter bucketing on every pipeline stage.
+
+    By default, MCore collapses each parameter buffer to one bucket on pipeline ranks
+    greater than zero, on the assumption that their data-parallel communication can be
+    hidden behind the remaining pipeline backward wave. Enable this when traces show a
+    large end-of-iteration collective tail on those stages.
+    """
 
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
